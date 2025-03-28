@@ -1,6 +1,7 @@
 from collections import defaultdict
 from enum import Enum
 import io
+import sys
 import numpy as np
 import time
 import matplotlib.pyplot as plt
@@ -79,27 +80,27 @@ hidden_dim = 4096
 computation = get_mlp_n_layer_computation(num_layers, batch_size, hidden_dim,hidden_dim, hidden_dim)
 # N: the number of nodes;
 # Assume each node has 4 GPU
-for N in [200]:
-    print("Node size =", N)
-    start_time = time.time()
-    device = [(i, 4) for i in range(1, N + 1)]
+N = 3000
+print("Node size =", N)
+start_time = time.time()
+device = [(i, 4) for i in range(1, N + 1)]
+with open("/alpa/mesh_solver.log", "a") as log_file:
     for mesh_shape in device:
+        print("mesh_shape", mesh_shape, file=log_file)
         device_mesh = np.arange(np.prod(mesh_shape)).reshape(mesh_shape)
         cluster_env = ClusterEnvironment(device_mesh, [1, 1], [1, 0.01],
-                                             memory_per_device=1000 * MB)
+                                         memory_per_device=1000 * MB)
         objective = solve_auto_sharding(computation, cluster_env)
+        if mesh_shape[0] in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 3000]:
+            end_time = time.time()
+            execution_times.append(end_time - start_time)
+            print("----Time elapse-----", end_time - start_time, file=log_file)
+plt.figure(figsize=(10, 6))
+plt.plot(range(1, 10), execution_times, label="Execution Time")
+plt.xlabel("N (Number of devices)")
+plt.ylabel("Execution Time (seconds)")
+plt.title("Execution Time per Iteration as N increases")
+plt.legend()
+plt.grid(True)
 
-    end_time = time.time()
-    execution_times.append(end_time - start_time)
-    print("Time elapse", end_time - start_time)
-
-
-# plt.figure(figsize=(10, 6))
-# plt.plot(range(1, 10), execution_times, label="Execution Time")
-# plt.xlabel("N (Number of devices)")
-# plt.ylabel("Execution Time (seconds)")
-# plt.title("Execution Time per Iteration as N increases")
-# plt.legend()
-# plt.grid(True)
-
-# plt.savefig("execution_time_plot.png")
+plt.savefig("execution_time_plot.png")

@@ -833,10 +833,15 @@ def _call_solver_serialized_args(N,
                                msg=msg,
                                timeLimit=time_limit,
                                threads=multiprocessing.cpu_count())
-    print("start to solve ILP", file=sys.stderr)
-    prob.solve(solver)
-    print("solver finish", file=sys.stderr)
-
+    
+    with open("/alpa/mesh_solver.log", "a") as log_file:
+        print("start to solve ILP", file=log_file)
+        
+        start_time = time.time()
+        prob.solve(solver)  
+        end_time = time.time()
+        
+        print("Time elapse", end_time - start_time, file=log_file)
     status = prob.status
     objective = pulp.value(prob.objective)
     objective = float(objective) if objective is not None else -1.0

@@ -1,3 +1,294 @@
+# Alpa simulation
+
+### 1. Setup
+
+**Experiment environment：**
+
+Operating System: Ubuntu 22.04.5 LTS
+
+Kernel Version: 5.15.0-125-generic
+
+CUDA Version: 12.1.1
+
+NVIDIA Driver Version: 535.216.03
+
+cuDNN Version: 8.9.7.29
+
+#### Install Docker：
+
+```bash
+# Add Docker's official GPG key:
+sudo apt-get update
+sudo apt-get install ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+# Add the repository to Apt sources:
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update
+```
+
+```bash
+# Install the Docker packages.
+sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+```
+
+####  Install NVIDIA Container Toolkit 
+
+```bash
+# Configure the production repository:
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+  && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+    sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+```
+
+```bash
+# Install the NVIDIA Container Toolkit packages
+sudo apt-get update
+sudo apt-get install -y nvidia-container-toolkit
+```
+
+#### Start Container
+
+**Image link:**
+
+https://hub.docker.com/r/jiaodong/alpa
+
+```python
+# Start Container
+docker run --gpus all \
+  --network host \
+  --shm-size=9.51gb \
+  -v ~/alpa:/alpa \
+  -it jiaodong/alpa /bin/bash
+```
+
+`--gpus all`:
+It allows the container to access all available GPUs on the host machine. It requires NVIDIA Container Toolkit to be installed.
+
+`--network host`:
+This option makes the container share the host's network stack. It allows the container to access network interfaces and ports exactly as if it were running on the host directly. 
+
+`--shm-size=9.51gb`:
+ This sets the size of the container’s shared memory (/dev/shm) to 9.51 GB.
+
+
+
+### 2. Key function Analysis
+
+- ##### `solve_auto_sharding():` 
+
+This function is the core solver in Alpa's intra-op parallelization framework.
+
+It takes an HLO computation and a cluster environment as input, then constructs and solves an Integer Linear Programming (ILP) problem to determine the most efficient sharding strategy for each operator in the computation graph.
+**Input:**
+
+`computation`: The HLO module or computation graph to be parallelized.
+
+`cluster_env`: Cluster environment metadata, including device mesh topology, memory, and communication cost models.
+
+`solver_option`: Optional parameters controlling the solver's behavior.
+
+```python
+def solve_auto_sharding(computation, cluster_env, solver_option=None):
+	......
+    # For each HLO instruction, enumerate possible sharding strategies,
+    # and compute the cost metrics for each strategy, including:
+    # - Communication cost
+    # - Memory cost
+    # - Resharding cost (when input layout doesn't match required layout)
+    computation.build_strategy_and_cost(cluster_env, solver_option)
+
+    # Build all constants for ILP
+    N = len(computation.instructions)
+    M = cluster_env.memory_per_device
+	
+    ...
+    # Traverse each HLO instruction
+    for i in range(N):
+        ins = computation.instructions[i]
+        s_len.append(len(ins.strategies))
+        L.append([ins.index for ins in liveness_dict[i]])
+        c.append(ins.compute_costs)        # Compute cost for each strategy
+        d.append(ins.communication_costs)  # Communication cost for each strategy
+        m.append(ins.memory_costs)         # Memory usage for each strategy
+
+        if ins.follow_ins is not None:
+            follow_pair.append((ins.index, ins.follow_ins.index))
+
+        for op_idx, operand in enumerate(ins.operands):
+            # Record the dependency edge: from operand (source) to this instruction (destination)
+            E.append((operand.index, i))
+
+            src = operand.index  # The index of the operand instruction (producer)
+            dst = i              # The index of the current instruction (consumer)
+
+            cost = []
+            # For all combinations of strategies between producer and consumer,
+            # retrieve the resharding cost needed to transform the src's output
+            # into the required input format for the dst
+            for p in range(len(computation.instructions[src].strategies)):     # src's strategies
+                for q in range(len(computation.instructions[dst].strategies)):  # dst's strategies
+                    cost.append(ins.resharding_costs[q][op_idx][p])
+            # Add the resharding cost list for this edge (resharding cost matrix: q × p)
+            r.append(cost)
+
+
+    # Simplify the graph by merging nodes
+	...
+
+    # Deal with alias
+	...
+    
+
+    #s_val       List[int]: selected strategy index for each instruction
+    #e_val       List[int]: selected edge resharding plan for each dependency edge
+    #objective   float:     total cost of the selected sharding plan (objective function value)
+    s_val, e_val, objective, status = call_solver(N, M, s_len, s_follow, E, A, L,
+                                                  c, d, m, r, v, s_init=None)
+    
+  
+    # Print Result
+	...
+    
+    return objective
+
+```
+
+- `call_solver()`   
+
+This function convert the structure list data into flat NumPy arrays, then pass them to the lower-level `_call_solver_serialized_args()` function to perform the actual optimization.
+
+- `_call_solver_serialized_args()`
+
+This function performs the core ILP optimization for Alpa's intra-op process.
+
+The mathematical formulation of the ILP problem is: 
+$$
+\mathcal{P}_1 : 
+\min_{\{\vec{s}_v\}_{v \in V}} \sum_{v \in V} \vec{s}_v^\top (\vec{c}_v + \vec{d}_v) + \sum_{e_{uv} \in E} \vec{s}_u^\top R_{uv} \vec{s}_v,
+
+subject to:
+
+\quad \vec{s}_v \in \{0,1\}^{k_v}, \quad \sum_i s_{vi} = 1,\quad \forall v \in V.
+$$
+
+```python
+def _call_solver_serialized_args(...):
+    ...
+
+    # === Build the ILP problem ===
+    # Builds an ILP problem using the pulp optimization library, with:
+    # - Objective: Minimize total compute, communication, and resharing costs
+    # - Constraints:
+    #   - Each node chooses exactly one strategy
+    #   - Total memory usage at any time must not exceed device budget
+    #   - Edge resharding strategies must be consistent with node strategies
+    #   - Alias instructions must not use incompatible strategies
+
+    prob = LpProblem("myProblem", LpMinimize)
+
+    # Objective function: minimize compute + communication + resharing cost
+    obj = 0
+    for i in range(N):
+        obj += lpDot(s[i], c[i]) + lpDot(s[i], d[i])  # compute + comm
+    for i in range(len(E)):
+        obj += lpDot(e[i], r[i])  # resharing
+    prob += obj
+
+	...
+    
+    # === Solve the ILP problem ===
+    # Solves the ILP problem using the CBC solver (PULP_CBC_CMD)
+    solver = pulp.PULP_CBC_CMD(...)
+    prob.solve(solver)
+
+    # ===  Extract and validate solution ===
+    # Extracts the final solution:
+    # - s_val: Selected strategy index for each instruction
+    # - e_val: Selected resharing plan for each edge
+    # - objective: Total cost of the chosen sharding plan
+
+    return s_val, e_val, objective, status
+
+```
+
+### 3. Simulation
+
+#### 3.1 Intra-op
+
+In the intra-op simulation, we use the function `solve_auto_sharding()` introduced in Section 2 to perform the simulation.
+
+For the experiment with the LLaMA2-13B model, we need to construct the HLO computation graph of the model. The specific parameters are set as follows:
+
+```python
+def get_LLaMa_forward_computation(batch_size, seq_len, hidden_dim, num_head, num_layers,ffn_dim, force_replicated_output):
+    """
+    Implements the forward pass of the LLaMA model using HLO operations.
+    
+    - The function consists of multiple Transformer blocks, each containing:
+        1. RMSNorm before attention computation
+        2. Multi-Head Self-Attention (MHSA)
+        3. Residual connection
+        4. RMSNorm before feedforward computation
+        5. FeedForward Network (FFN)
+        6. Residual connection
+    - The final output is the hidden states after all layers.
+    - The function supports force-replicated output if required.
+    
+    Args:
+        batch_size (int): Number of sequences in a batch.
+        seq_len (int): Sequence length.
+        hidden_dim (int): Model hidden size.
+        num_head (int): Number of attention heads.
+        num_layers (int): Number of Transformer layers (blocks).
+        force_replicated_output (bool): Whether to force replicated output.
+
+    Returns:
+        computation (HloComputation): The computation graph containing the LLaMA forward pass.
+    """
+```
+
+After that, we call `solve_auto_sharding()`, where the `ClusterEnvironment` parameter allows us to specify the number of nodes in the cluster, the number of GPUs per node, the bandwidth between and within nodes, and the memory capacity of a single GPU:
+
+```python
+mesh_shape = [50,4] # 50 nodes, each node has 4 GPU
+device_mesh = np.arange(np.prod(mesh_shape)).reshape(mesh_shape)
+cluster_env = ClusterEnvironment(device_mesh, [1, 1], [1, 0.01],
+                                     memory_per_device=32 * GB,
+                                     solver_option=solver_option)
+```
+
+**filepath:** `playground\auto_sharding_solver\simulate_intra_op.py`
+
+#### 3.2 Inter-op
+
+In the inter-op simulation part, I implemented the dynamic programming algorithm described in the paper to perform the simulation. The specific dynamic programming recurrence is as follows:
+$$
+F(s, k, d; t_{\text{max}}) = 
+\min_{\substack{k \leq i \leq K \\ n_s \cdot m_s \leq d}} 
+\left\{
+\begin{aligned}
+& t_{\text{intra}}\left((o_k, \ldots, o_i), \text{Mesh}(n_s, m_s), s\right) \\
+& + F(s - 1, i + 1, d - n_s \cdot m_s; t_{\text{max}})
+\end{aligned}
+\;\middle|\;
+t_{\text{intra}}\left((o_k, \ldots, o_i), \text{Mesh}(n_s, m_s), s\right) \leq t_{\text{max}}
+\right\}.
+$$
+Additionally, I implemented early pruning in the code to optimize the computational complexity. 
+
+**filepath:** `playground\auto_sharding_solver\simulate_inter_op.py`
+
+
+
+> *Note:* Original README starts from here
+---
 **Note: Alpa is not actively maintained currently. It is available as a research artifact. The core algorithm in Alpa has been merged into XLA, which is still being maintained. https://github.com/openxla/xla/tree/main/xla/hlo/experimental/auto_sharding**
 
 
