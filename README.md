@@ -169,14 +169,12 @@ This function convert the structure list data into flat NumPy arrays, then pass 
 This function performs the core ILP optimization for Alpa's intra-op process.
 
 The mathematical formulation of the ILP problem is: 
-$$
-\mathcal{P}_1 : 
-\min_{\{\vec{s}_v\}_{v \in V}} \sum_{v \in V} \vec{s}_v^\top (\vec{c}_v + \vec{d}_v) + \sum_{e_{uv} \in E} \vec{s}_u^\top R_{uv} \vec{s}_v,
 
-subject to:
+P1: minimize  
+∑₍ᵥ ∈ V₎ sᵥᵀ (cᵥ + dᵥ) + ∑₍ₑᵤᵥ ∈ E₎ sᵤᵀ Rᵤᵥ sᵥ
 
-\quad \vec{s}_v \in \{0,1\}^{k_v}, \quad \sum_i s_{vi} = 1,\quad \forall v \in V.
-$$
+Subject to:  
+sᵥ ∈ {0,1}^{kᵥ}, and ∑ᵢ sᵥᵢ = 1 for all v ∈ V
 
 ```python
 def _call_solver_serialized_args(...):
@@ -269,18 +267,13 @@ cluster_env = ClusterEnvironment(device_mesh, [1, 1], [1, 0.01],
 #### 3.2 Inter-op
 
 In the inter-op simulation part, I implemented the dynamic programming algorithm described in the paper to perform the simulation. The specific dynamic programming recurrence is as follows:
-$$
-F(s, k, d; t_{\text{max}}) = 
-\min_{\substack{k \leq i \leq K \\ n_s \cdot m_s \leq d}} 
-\left\{
-\begin{aligned}
-& t_{\text{intra}}\left((o_k, \ldots, o_i), \text{Mesh}(n_s, m_s), s\right) \\
-& + F(s - 1, i + 1, d - n_s \cdot m_s; t_{\text{max}})
-\end{aligned}
-\;\middle|\;
-t_{\text{intra}}\left((o_k, \ldots, o_i), \text{Mesh}(n_s, m_s), s\right) \leq t_{\text{max}}
-\right\}.
-$$
+
+F(s, k, d; t_max) =  
+    min over k ≤ i ≤ K such that n_s * m_s ≤ d:
+        if t_intra((o_k, ..., o_i), Mesh(n_s, m_s), s) ≤ t_max:
+            t_intra((o_k, ..., o_i), Mesh(n_s, m_s), s) 
+            + F(s - 1, i + 1, d - n_s * m_s; t_max)
+
 Additionally, I implemented early pruning in the code to optimize the computational complexity. 
 
 **filepath:** `playground\auto_sharding_solver\simulate_inter_op.py`
